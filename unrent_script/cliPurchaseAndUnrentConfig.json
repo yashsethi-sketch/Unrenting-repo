@@ -1,0 +1,9 @@
+{
+    "allowRent": false,
+    "doYouReallyWantToRentNumbers": false,
+    "maxNumbersToRent": 0,
+    "allowUnRent": true,
+    "numbersToBeUnrent": [
+        "YOUR_PHONE_NUMBER_HERE"
+    ]
+}
