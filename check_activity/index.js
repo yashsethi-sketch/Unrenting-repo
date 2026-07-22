@@ -17,6 +17,7 @@ const CONFIG = {
     sheetId: process.env.GOOGLE_SHEET_ID,
     serviceAccountFile: process.env.GOOGLE_SERVICE_ACCOUNT_FILE || 'service_account.json',
     lastCallColumn: process.env.LAST_CALL_COLUMN || 'N',
+    tabName: process.env.SHEET_TAB_NAME || 'Sheet1',
   },
 
   // Script settings
@@ -47,7 +48,7 @@ const plivoApi = axios.create({
     username: CONFIG.plivo.authId,
     password: CONFIG.plivo.authToken,
   },
-  timeout: 30000,
+  timeout: 120000,
 });
 
 const MAX_RETRIES = 3;
@@ -193,33 +194,40 @@ async function getLastCallDate(number) {
   try {
     // Normalize phone number
     const rawNumber = number.trim();
-
-    const voiceNumber = rawNumber.startsWith('+') ? rawNumber : '+' + rawNumber;
-
+    // Plivo Voice List Calls API matches numbers WITHOUT + prefix (confirmed via dashboard)
     const strippedNumber = rawNumber.startsWith('+') ? rawNumber.substring(1) : rawNumber;
 
-    // Check all APIs sequentially with delay between them
-    const voiceOutDate = await fetchLastVoiceUsage(voiceNumber, 'outbound');
-    await new Promise(resolve => setTimeout(resolve, 2000)); // 2s gap between APIs
-    const voiceInDate = await fetchLastVoiceUsage(voiceNumber, 'inbound');
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    const zentrunkOutDate = await fetchLastZentrunkCall(strippedNumber, 'outbound');
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    const zentrunkInDate = await fetchLastZentrunkCall(strippedNumber, 'inbound');
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - CONFIG.lookbackDays);
 
-    // Find the most recent date across all directions
+    // 1. Check Voice Outbound
+    const voiceOutDate = await fetchLastVoiceUsage(strippedNumber, 'outbound');
+    if (voiceOutDate && voiceOutDate >= cutoffDate) return formatDate(voiceOutDate);
+    // Smart Cooldown: If null (4XX error), wait 3s to appease firewall. Else, 200ms.
+    await new Promise(resolve => setTimeout(resolve, !voiceOutDate ? 3000 : 200)); 
+
+    // 2. Check Voice Inbound
+    const voiceInDate = await fetchLastVoiceUsage(strippedNumber, 'inbound');
+    if (voiceInDate && voiceInDate >= cutoffDate) return formatDate(voiceInDate);
+    await new Promise(resolve => setTimeout(resolve, !voiceInDate ? 3000 : 200));
+
+    // 3. Check Zentrunk Outbound
+    const zentrunkOutDate = await fetchLastZentrunkCall(strippedNumber, 'outbound');
+    if (zentrunkOutDate && zentrunkOutDate >= cutoffDate) return formatDate(zentrunkOutDate);
+    await new Promise(resolve => setTimeout(resolve, !zentrunkOutDate ? 3000 : 200));
+
+    // 4. Check Zentrunk Inbound
+    const zentrunkInDate = await fetchLastZentrunkCall(strippedNumber, 'inbound');
+    if (zentrunkInDate && zentrunkInDate >= cutoffDate) return formatDate(zentrunkInDate);
+
+    // Find the most recent date across all directions (Fallback)
     const dates = [voiceOutDate, voiceInDate, zentrunkOutDate, zentrunkInDate].filter(Boolean);
     let latestDate = dates.length > 0 ? dates.reduce((a, b) => (a > b ? a : b)) : null;
 
     // Filter by lookback period (30 days)
-    if (latestDate) {
-      const cutoffDate = new Date();
-      cutoffDate.setDate(cutoffDate.getDate() - CONFIG.lookbackDays);
-
-      if (latestDate < cutoffDate) {
-        // Call is older than 30 days, return empty
-        return '';
-      }
+    if (latestDate && latestDate < cutoffDate) {
+      // Call is older than 30 days, return empty
+      return '';
     }
 
     return formatDate(latestDate);
@@ -254,7 +262,7 @@ async function readSheet(sheets) {
   try {
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: CONFIG.sheets.sheetId,
-      range: 'Sheet1',
+      range: CONFIG.sheets.tabName,
     });
 
     return response.data.values || [];
@@ -402,28 +410,37 @@ async function main() {
     return;
   }
 
-  // Process numbers strictly one at a time (sequential)
+  // Process numbers concurrently
   let processed = 0;
   let updateBuffer = [];
+  let index = 0;
 
-  for (const { number, row } of numbersToProcess) {
-    const lastCallDate = await getLastCallDate(number);
+  async function worker() {
+    while (true) {
+      const currentIndex = index++;
+      if (currentIndex >= numbersToProcess.length) break;
 
-    processed++;
-    console.log(`[${processed}/${total}] Row ${row} (${number}): ${lastCallDate || 'No calls found'}`);
+      const { number, row } = numbersToProcess[currentIndex];
+      const lastCallDate = await getLastCallDate(number);
 
-    updateBuffer.push({ row, value: lastCallDate });
+      processed++;
+      console.log(`[${processed}/${total}] Row ${row} (${number}): ${lastCallDate || 'No calls found'}`);
 
-    // Batch update when buffer reaches threshold
-    if (updateBuffer.length >= CONFIG.batchUpdateSize) {
-      const toUpdate = [...updateBuffer];
-      updateBuffer = [];
-      await batchUpdateSheet(sheets, toUpdate);
+      updateBuffer.push({ row, value: lastCallDate });
+
+      // Batch update when buffer reaches threshold
+      // Safe: updateBuffer = [] runs before any await, so no double-flush
+      if (updateBuffer.length >= CONFIG.batchUpdateSize) {
+        const toUpdate = [...updateBuffer];
+        updateBuffer = [];
+        await batchUpdateSheet(sheets, toUpdate);
+      }
     }
-
-    // 5s delay between numbers
-    await new Promise(resolve => setTimeout(resolve, 3000));
   }
+
+  // Launch N concurrent workers
+  console.log(`🔀 Launching ${CONFIG.maxConcurrentRequests} concurrent workers...\n`);
+  await Promise.all(Array.from({ length: CONFIG.maxConcurrentRequests }, () => worker()));
 
   // Update remaining records
   if (updateBuffer.length > 0) {

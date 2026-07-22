@@ -1,3 +1,8 @@
 node_modules/
 .env
 .DS_Store
+
+check_activity/service_account.json
+check_activity/service_account.json.local
+check_activity/.env
+check_activity/node_modules/
