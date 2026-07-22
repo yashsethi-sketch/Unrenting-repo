@@ -38,12 +38,20 @@ This script checks a Google Sheet containing phone numbers and verifies if they 
 
    # Column letter for last call date (default: N)
    LAST_CALL_COLUMN=N
+
+   # Google Sheets Tab Name (e.g. Sheet1, or tab name at the bottom of sheets)
+   SHEET_TAB_NAME=Sheet1
    ```
 4. Replace the contents of `service_account.json` with your actual Google Cloud service account keys.
 5. Run the script:
    ```bash
    node index.js
    ```
+
+### ⚠️ Critical Rate Limit & Timing Warnings:
+- **Do not run during live call traffic:** The script checks inactive numbers by querying Plivo API endpoints. If a number has no recent call record, the API returns a `404/4XX` status. Plivo uses a **shared reactive rate limiter** for all API traffic (including live `Make Call` requests). Generating a burst of `4XX` responses from this script will poison that shared reactive bucket, causing your live, production `Make Call` requests to fail with `429 Too Many Requests`.
+- **Run this script strictly during off-hours/maintenance windows** when there is no active outbound/inbound production traffic.
+- **Concurrency control:** You can configure `MAX_CONCURRENT_REQUESTS` (e.g., set it to `5` or `10`) to speed up execution. However, higher concurrency will exhaust the reactive error bucket faster if many consecutive numbers have no call records. If you experience throttled/timeout requests, reduce concurrency.
 
 ### Creating the Google Cloud Service Account (`service_account.json`):
 To allow the script to read your Google Sheet, you need a Google Cloud Service Account.
